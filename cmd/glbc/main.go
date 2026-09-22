@@ -27,10 +27,12 @@ import (
 	"sync"
 	"time"
 
+	metrics "github.com/GoogleCloudPlatform/gke-enterprise-mt/pkg/mtmetrics"
 	firewallcrclient "github.com/GoogleCloudPlatform/gke-networking-api/client/gcpfirewall/clientset/versioned"
 	networkclient "github.com/GoogleCloudPlatform/gke-networking-api/client/network/clientset/versioned"
 	nodetopologyclient "github.com/GoogleCloudPlatform/gke-networking-api/client/nodetopology/clientset/versioned"
 	k8scp "github.com/GoogleCloudPlatform/k8s-cloud-provider/pkg/cloud"
+	"github.com/prometheus/client_golang/prometheus"
 	crdclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -69,7 +71,7 @@ import (
 	"k8s.io/ingress-gce/pkg/flags"
 	_ "k8s.io/ingress-gce/pkg/klog"
 	"k8s.io/ingress-gce/pkg/neg"
-	"k8s.io/ingress-gce/pkg/neg/metrics"
+	negmetrics "k8s.io/ingress-gce/pkg/neg/metrics"
 	syncMetrics "k8s.io/ingress-gce/pkg/neg/metrics/metricscollector"
 	"k8s.io/ingress-gce/pkg/neg/syncers/labels"
 	negtypes "k8s.io/ingress-gce/pkg/neg/types"
@@ -166,7 +168,7 @@ func main() {
 	}
 
 	// register NEG prometheus metrics
-	metrics.RegisterMetrics()
+	negmetrics.RegisterMetrics()
 	syncMetrics.RegisterMetrics()
 
 	if flags.F.EnableNEGController {
@@ -286,8 +288,6 @@ func main() {
 				klog.Fatalf("Failed to create ProviderConfig client: %v", err)
 			}
 			ctx := context.Background()
-			syncerMetrics := syncMetrics.NewNegMetricsCollector(flags.F.NegMetricsExportInterval, rootLogger)
-			go syncerMetrics.Run(stopCh)
 
 			if flags.F.LeaderElection.LeaderElect {
 				err := multiprojectstart.StartWithLeaderElection(
@@ -306,7 +306,6 @@ func main() {
 					gceCreator,
 					namer,
 					stopCh,
-					syncerMetrics,
 				)
 				if err != nil {
 					rootLogger.Error(err, "Failed to start multi-project syncer with leader election")
@@ -326,7 +325,6 @@ func main() {
 					gceCreator,
 					namer,
 					stopCh,
-					syncerMetrics,
 				)
 			}
 		}, rOption.wg)
@@ -337,6 +335,12 @@ func main() {
 
 		// Since we only want multi-project mode functionality, exit here
 		return
+	}
+
+	stdFactory := metrics.NewStdMetricFactory(prometheus.DefaultRegisterer)
+	negMetrics, err := negmetrics.NewNegMetricsWithFactory(stdFactory)
+	if err != nil {
+		klog.Fatalf("Failed to initialize NEG metrics: %v", err)
 	}
 
 	cloud := app.NewGCEClient(rootLogger)
@@ -399,7 +403,7 @@ func main() {
 		logger.Info("Start running the enabled controllers",
 			"NEG controller", flags.F.EnableNEGController,
 		)
-		err := runNEGController(ctx, systemHealth, rOption, logger)
+		err := runNEGController(ctx, systemHealth, rOption, logger, negMetrics)
 		if err != nil {
 			klog.Fatalf("failed to run NEG controller: %s", err)
 		}
@@ -430,7 +434,7 @@ func main() {
 			logger.Info("Start running NEG leader election",
 				"NEG controller", flags.F.EnableNEGController,
 			)
-			negRunner, err := makeNEGRunnerWithLeaderElection(ctx, systemHealth, rOption, leOption, logger)
+			negRunner, err := makeNEGRunnerWithLeaderElection(ctx, systemHealth, rOption, leOption, logger, negMetrics)
 			if err != nil {
 				klog.Fatalf("makeNEGLeaderElectionConfig()=%v, want nil", err)
 			}
@@ -525,12 +529,13 @@ func makeNEGRunnerWithLeaderElection(
 	runOption runOption,
 	leOption leaderElectionOption,
 	logger klog.Logger,
+	negMetrics *negmetrics.NegMetrics,
 ) (*leaderelection.LeaderElectionConfig, error) {
 	return makeRunnerWithLeaderElection(
 		leOption,
 		negLockName,
 		func(context.Context) {
-			err := runNEGController(ctx, systemHealth, runOption, logger)
+			err := runNEGController(ctx, systemHealth, runOption, logger, negMetrics)
 			if err != nil {
 				klog.Fatalf("failed to run NEG controller: %s", err)
 			}
@@ -696,13 +701,13 @@ func runL4Controllers(ctx *ingctx.ControllerContext, systemHealth *systemhealth.
 	ctx.Start(option.stopCh)
 }
 
-func runNEGController(ctx *ingctx.ControllerContext, systemHealth *systemhealth.SystemHealth, option runOption, logger klog.Logger) error {
+func runNEGController(ctx *ingctx.ControllerContext, systemHealth *systemhealth.SystemHealth, option runOption, logger klog.Logger, negMetrics *negmetrics.NegMetrics) error {
 	lockLogger := logger.WithValues("lockName", negLockName)
 	lockLogger.Info("Attempting to grab lock", "lockName", negLockName)
 	go collectLockAvailabilityMetrics(negLockName, flags.F.GKEClusterType, option.stopCh, logger)
 
 	if flags.F.EnableNEGController {
-		negController, err := createNEGController(ctx, systemHealth, option.stopCh, logger)
+		negController, err := createNEGController(ctx, systemHealth, option.stopCh, logger, negMetrics)
 		if err != nil {
 			return fmt.Errorf("failed to create NEG controller: %w", err)
 		}
@@ -719,7 +724,19 @@ func runNEGController(ctx *ingctx.ControllerContext, systemHealth *systemhealth.
 	return nil
 }
 
-func createNEGController(ctx *ingctx.ControllerContext, systemHealth *systemhealth.SystemHealth, stopCh <-chan struct{}, logger klog.Logger) (*neg.Controller, error) {
+func createNEGController(
+	ctx *ingctx.ControllerContext,
+	systemHealth *systemhealth.SystemHealth,
+	stopCh <-chan struct{},
+	logger klog.Logger,
+	negMetrics *negmetrics.NegMetrics,
+) (*neg.Controller, error) {
+	stdFactory := metrics.NewStdMetricFactory(prometheus.DefaultRegisterer)
+	syncerMetrics, err := syncMetrics.NewNegMetricsCollectorWithFactory(flags.F.NegMetricsExportInterval, stdFactory, logger)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize syncer metrics: %w", err)
+	}
+	go syncerMetrics.Run(stopCh)
 	zoneGetter := ctx.ZoneGetter
 
 	// In NonGCP mode, use the zone specified in gce.conf directly.
@@ -745,10 +762,6 @@ func createNEGController(ctx *ingctx.ControllerContext, systemHealth *systemheal
 		// if it was not possible to retrieve network information use standard context as cloud network provider
 		adapter = ctx.Cloud
 	}
-
-	negMetrics := metrics.NewNegMetrics()
-	syncerMetrics := syncMetrics.NewNegMetricsCollector(flags.F.NegMetricsExportInterval, logger)
-	go syncerMetrics.Run(stopCh)
 
 	// TODO: Refactor NEG to use cloud mocks so ctx.Cloud can be referenced within NewController.
 	negController, err := neg.NewController(

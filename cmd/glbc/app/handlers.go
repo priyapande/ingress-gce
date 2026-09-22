@@ -20,12 +20,15 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 
+	metrics "github.com/GoogleCloudPlatform/gke-enterprise-mt/pkg/mtmetrics"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"k8s.io/klog/v2"
 
@@ -37,12 +40,30 @@ import (
 // RunHTTPServer starts an HTTP server. `healthChecker` returns a mapping of component/controller
 // name to the result of its healthcheck.
 func RunHTTPServer(healthChecker func() systemhealth.HealthCheckResults, logger klog.Logger) {
+	gatherer, ok := metrics.DefaultMultiGatherer.(prometheus.Gatherer)
+	if !ok {
+		klog.Fatal("Failed to initialize multi-tenant metrics: metrics.DefaultMultiGatherer does not implement prometheus.Gatherer")
+	}
+
 	http.HandleFunc("/healthz", healthCheckHandler(healthChecker, logger))
 	http.HandleFunc("/flag", flagHandler)
 	http.Handle("/metrics", promhttp.Handler())
+	http.HandleFunc("/metrics/multitenancy", loopbackOnly(promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{})))
 
 	logger.V(0).Info("Running http server", "port", flags.F.HealthzPort)
 	klog.Fatal(http.ListenAndServe(fmt.Sprintf(":%v", flags.F.HealthzPort), nil))
+}
+
+func loopbackOnly(next http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		ip := net.ParseIP(host)
+		if err == nil && ip != nil && ip.IsLoopback() {
+			next.ServeHTTP(w, r)
+			return
+		}
+		http.Error(w, "Forbidden: accessed from outside localhost", http.StatusForbidden)
+	}
 }
 
 func RunSIGTERMHandler(closeStopCh func(), logger klog.Logger) {

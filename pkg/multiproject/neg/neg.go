@@ -3,8 +3,10 @@ package neg
 import (
 	"fmt"
 
+	metrics "github.com/GoogleCloudPlatform/gke-enterprise-mt/pkg/mtmetrics"
 	networkclient "github.com/GoogleCloudPlatform/gke-networking-api/client/network/clientset/versioned"
 	nodetopologyclient "github.com/GoogleCloudPlatform/gke-networking-api/client/nodetopology/clientset/versioned"
+	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
@@ -13,7 +15,7 @@ import (
 	"k8s.io/ingress-gce/pkg/flags"
 	multiprojectinformers "k8s.io/ingress-gce/pkg/multiproject/neg/informerset"
 	"k8s.io/ingress-gce/pkg/neg"
-	"k8s.io/ingress-gce/pkg/neg/metrics"
+	negmetrics "k8s.io/ingress-gce/pkg/neg/metrics"
 	syncMetrics "k8s.io/ingress-gce/pkg/neg/metrics/metricscollector"
 	"k8s.io/ingress-gce/pkg/neg/syncers/labels"
 	negtypes "k8s.io/ingress-gce/pkg/neg/types"
@@ -60,10 +62,23 @@ func StartNEGController(
 	globalStopCh <-chan struct{},
 	logger klog.Logger,
 	providerConfig *providerconfig.ProviderConfig,
-	syncerMetrics *syncMetrics.SyncerMetrics,
 ) (chan<- struct{}, error) {
 	providerConfigName := providerConfig.Name
 	logger.V(2).Info("Initializing NEG controller", "providerConfig", providerConfigName)
+
+	tenantUID := providerConfig.Name
+	if providerConfig.Spec.PrincipalInfo != nil && providerConfig.Spec.PrincipalInfo.ID != "" {
+		tenantUID = providerConfig.Spec.PrincipalInfo.ID
+	}
+	mtFactory := metrics.NewMTMetricFactory(tenantUID, prometheus.DefaultRegisterer, metrics.DefaultGlobalTracker)
+	// DefaultMultiGatherer.Register returns an error without overwriting if tenantUID
+	// is still present (e.g. during framework/manager.go's 24-hour ForceCleanupTenant
+	// retention window when a ProviderConfig is recreated). Unregister first so the
+	// new controller's mtFactory.Registry() replaces any prior registry for this tenant.
+	metrics.DefaultMultiGatherer.Unregister(tenantUID)
+	if err := metrics.DefaultMultiGatherer.Register(tenantUID, mtFactory.Registry()); err != nil {
+		logger.Error(err, "Failed to register multi-tenant gatherer for tenant", "tenantUID", tenantUID)
+	}
 
 	// The ProviderConfig-specific stop channel. We close this in StopControllersForProviderConfig.
 	providerConfigStopCh := make(chan struct{})
@@ -74,6 +89,11 @@ func StartNEGController(
 		defer func() {
 			close(joinedStopCh)
 			logger.V(2).Info("NEG controller stop channel closed")
+			// Reset active tenant gauges in the global /metrics tracker immediately on stop.
+			// DefaultMultiGatherer unregistration is managed by framework/manager.go's
+			// ForceCleanupTenant after the 24-hour grace period (or by pre-register Unregister
+			// above if the tenant is restarted earlier).
+			mtFactory.Cleanup()
 		}()
 		select {
 		case <-globalStopCh:
@@ -83,6 +103,14 @@ func StartNEGController(
 		}
 	}()
 
+	tenantSyncerMetrics, err := syncMetrics.NewNegMetricsCollectorWithFactory(flags.F.NegMetricsExportInterval, mtFactory, logger)
+	if err != nil {
+		metrics.DefaultMultiGatherer.Unregister(tenantUID)
+		close(providerConfigStopCh)
+		return nil, fmt.Errorf("failed to initialize syncer metrics: %w", err)
+	}
+	go tenantSyncerMetrics.Run(joinedStopCh)
+
 	// Wrap informers with provider config filter
 	filteredInformers := informers.FilterByProviderConfig(providerConfigName)
 	hasSynced := filteredInformers.CombinedHasSynced()
@@ -90,6 +118,8 @@ func StartNEGController(
 	zoneGetter, err := zonegetter.NewZoneGetter(filteredInformers.Node, filteredInformers.NodeTopology, cloud.SubnetworkURL())
 	if err != nil {
 		logger.Error(err, "failed to initialize zone getter")
+		metrics.DefaultMultiGatherer.Unregister(tenantUID)
+		close(providerConfigStopCh)
 		return nil, fmt.Errorf("failed to initialize zonegetter: %v", err)
 	}
 
@@ -117,10 +147,13 @@ func StartNEGController(
 		lpConfig,
 		joinedStopCh,
 		logger,
-		syncerMetrics,
+		mtFactory,
+		tenantSyncerMetrics,
 	)
 
 	if err != nil {
+		metrics.DefaultMultiGatherer.Unregister(tenantUID)
+		close(providerConfigStopCh)
 		return nil, fmt.Errorf("failed to create NEG controller: %w", err)
 	}
 
@@ -153,6 +186,7 @@ func createNEGController(
 	lpConfig labels.PodLabelPropagationConfig,
 	stopCh <-chan struct{},
 	logger klog.Logger,
+	factory metrics.MetricFactory,
 	syncerMetrics *syncMetrics.SyncerMetrics,
 ) (*neg.Controller, error) {
 
@@ -164,7 +198,10 @@ func createNEGController(
 	}
 
 	noDefaultBackendServicePort := utils.ServicePort{}
-	negMetrics := metrics.NewNegMetrics()
+	negMetrics, err := negmetrics.NewNegMetricsWithFactory(factory)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create NEG metrics: %w", err)
+	}
 
 	negController, err := newNEGController(
 		kubeClient,

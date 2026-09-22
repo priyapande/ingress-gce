@@ -4,8 +4,10 @@ import (
 	"testing"
 	"time"
 
+	mtmetrics "github.com/GoogleCloudPlatform/gke-enterprise-mt/pkg/mtmetrics"
 	networkclient "github.com/GoogleCloudPlatform/gke-networking-api/client/network/clientset/versioned"
 	nodetopologyclient "github.com/GoogleCloudPlatform/gke-networking-api/client/nodetopology/clientset/versioned"
+	"github.com/prometheus/client_golang/prometheus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -125,7 +127,7 @@ func TestStartNEGController_StopJoin(t *testing.T) {
 				// Wire the join to the real globalStop for this subcase.
 				joinStop = globalStop
 				var err error
-				providerStop, err = StartNEGController(informers, kubeClient, kubeClient, svcnegfake.NewSimpleClientset(), negBindingClient, networkclient.Interface(nil), nodetopologyclient.Interface(nil), kubeSystemUID, rootNamer, l4Namer, lpCfg, cloud, joinStop, logger, pc, syncMetrics.FakeSyncerMetrics())
+				providerStop, err = StartNEGController(informers, kubeClient, kubeClient, svcnegfake.NewSimpleClientset(), negBindingClient, networkclient.Interface(nil), nodetopologyclient.Interface(nil), kubeSystemUID, rootNamer, l4Namer, lpCfg, cloud, joinStop, logger, pc)
 				if err != nil {
 					t.Fatalf("StartNEGController: %v", err)
 				}
@@ -135,7 +137,7 @@ func TestStartNEGController_StopJoin(t *testing.T) {
 				js := make(chan struct{})
 				joinStop = js
 				var err error
-				providerStop, err = StartNEGController(informers, kubeClient, kubeClient, svcnegfake.NewSimpleClientset(), negBindingClient, networkclient.Interface(nil), nodetopologyclient.Interface(nil), kubeSystemUID, rootNamer, l4Namer, lpCfg, cloud, joinStop, logger, &providerconfig.ProviderConfig{ObjectMeta: metav1.ObjectMeta{Name: "pc-2"}}, syncMetrics.FakeSyncerMetrics())
+				providerStop, err = StartNEGController(informers, kubeClient, kubeClient, svcnegfake.NewSimpleClientset(), negBindingClient, networkclient.Interface(nil), nodetopologyclient.Interface(nil), kubeSystemUID, rootNamer, l4Namer, lpCfg, cloud, joinStop, logger, &providerconfig.ProviderConfig{ObjectMeta: metav1.ObjectMeta{Name: "pc-2"}})
 				if err != nil {
 					t.Fatalf("StartNEGController (2): %v", err)
 				}
@@ -197,8 +199,91 @@ func TestStartNEGController_NilSvcNegClientErrors(t *testing.T) {
 	}
 
 	// newNEGController remains default (neg.NewController), which errors when svcNegClient is nil
-	ch, err := StartNEGController(informers, kubeClient, kubeClient, nil /* svcneg */, negBindingClient, networkclient.Interface(nil), nodetopologyclient.Interface(nil), kubeSystemUID, rootNamer, l4Namer, lpCfg, cloud, globalStop, logger, pc, syncMetrics.FakeSyncerMetrics())
+	ch, err := StartNEGController(informers, kubeClient, kubeClient, nil /* svcneg */, negBindingClient, networkclient.Interface(nil), nodetopologyclient.Interface(nil), kubeSystemUID, rootNamer, l4Namer, lpCfg, cloud, globalStop, logger, pc)
 	if err == nil {
 		t.Fatalf("expected error from StartNEGController when svcNegClient is nil, got nil and channel=%v", ch)
 	}
+}
+
+// TestStartNEGController_DefensiveUnregisterOnRapidRestart verifies that
+// StartNEGController defensively unregisters any prior registration for the same
+// tenant UID before re-registering in DefaultMultiGatherer.
+func TestStartNEGController_DefensiveUnregisterOnRapidRestart(t *testing.T) {
+	t.Parallel()
+
+	logger, _ := ktesting.NewTestContext(t)
+	kubeClient := k8sfake.NewSimpleClientset()
+	svcNegClient := svcnegfake.NewSimpleClientset()
+	negBindingClient := negbindingfake.NewSimpleClientset()
+
+	test.PrependBookmarkReactor(&kubeClient.Fake, kubeClient.Tracker(), "*", &providerconfig.ProviderConfig{
+		ObjectMeta: test.DefaultBookmarkObjectMeta,
+	})
+	test.PrependBookmarkReactor(&svcNegClient.Fake, svcNegClient.Tracker(), "*", &svcnegv1.ServiceNetworkEndpointGroup{
+		ObjectMeta: test.DefaultBookmarkObjectMeta,
+	})
+	test.PrependBookmarkReactor(&negBindingClient.Fake, negBindingClient.Tracker(), "*", &negbindingv1beta1.NetworkEndpointGroupBinding{
+		ObjectMeta: test.DefaultBookmarkObjectMeta,
+	})
+
+	informers := multiprojectinformers.NewInformerSet(kubeClient, svcNegClient, negBindingClient, networkclient.Interface(nil), nodetopologyclient.Interface(nil), metav1.Duration{})
+	globalStop := make(chan struct{})
+	t.Cleanup(func() { close(globalStop) })
+	if err := informers.Start(globalStop, logger); err != nil {
+		t.Fatalf("start informers: %v", err)
+	}
+
+	pc := &providerconfig.ProviderConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "pc-rapid-restart"},
+		Spec: providerconfig.ProviderConfigSpec{
+			PrincipalInfo: &providerconfig.PrincipalInfo{ID: "tenant-rapid-restart"},
+			ProjectID:     "test-project",
+			ProjectNumber: 123,
+			NetworkConfig: providerconfig.ProviderNetworkConfig{
+				Network:    "net-1",
+				SubnetInfo: providerconfig.ProviderConfigSubnetInfo{Subnetwork: "sub-1"},
+			},
+		},
+	}
+	kubeSystemUID := types.UID("uid")
+	rootNamer := namer.NewNamer("clusteruid", "", logger)
+	l4Namer := namer.NewL4Namer(string(kubeSystemUID), rootNamer)
+	lpCfg := labels.PodLabelPropagationConfig{}
+	gceCreator := multiprojectgce.NewGCEFake()
+	cloud, err := gceCreator.GCEForProviderConfig(pc, logger)
+	if err != nil {
+		t.Fatalf("create fake cloud: %v", err)
+	}
+
+	tenantUID := "tenant-rapid-restart"
+	defer mtmetrics.DefaultMultiGatherer.Unregister(tenantUID)
+
+	// Pre-register the tenant in DefaultMultiGatherer (simulating previous instance still registered)
+	dummyReg := prometheus.NewRegistry()
+	if err := mtmetrics.DefaultMultiGatherer.Register(tenantUID, dummyReg); err != nil {
+		t.Fatalf("failed to pre-register dummy tenant: %v", err)
+	}
+
+	// Calling StartNEGController should defensively unregister and succeed without "already registered" error
+	stopCh, err := StartNEGController(
+		informers,
+		kubeClient,
+		kubeClient,
+		svcNegClient,
+		negBindingClient,
+		networkclient.Interface(nil),
+		nodetopologyclient.Interface(nil),
+		kubeSystemUID,
+		rootNamer,
+		l4Namer,
+		lpCfg,
+		cloud,
+		globalStop,
+		logger,
+		pc,
+	)
+	if err != nil {
+		t.Fatalf("StartNEGController failed on rapid restart: %v", err)
+	}
+	close(stopCh)
 }
