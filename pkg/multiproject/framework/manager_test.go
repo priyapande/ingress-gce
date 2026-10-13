@@ -6,8 +6,11 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/GoogleCloudPlatform/gke-enterprise-mt/pkg/mtmetrics"
+	dto "github.com/prometheus/client_model/go"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	providerconfig "k8s.io/ingress-gce/pkg/apis/providerconfig/v1"
+	"k8s.io/ingress-gce/pkg/flags"
 	"k8s.io/ingress-gce/pkg/multiproject/common/finalizer"
 	providerconfigclient "k8s.io/ingress-gce/pkg/providerconfig/client/clientset/versioned/fake"
 	"k8s.io/klog/v2/ktesting"
@@ -555,5 +558,114 @@ func TestManagerStartClearsDeletingMap(t *testing.T) {
 
 	if exists {
 		t.Error("Expected tenant to be removed from deleting map after starting controllers again")
+	}
+}
+
+func getControllerRunningMetric(mfs []*dto.MetricFamily, tenantUID, controller string) (float64, bool) {
+	for _, mf := range mfs {
+		if mf.GetName() != "providerconfig_controller_running" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			var gotTenant, gotController string
+			for _, lp := range m.GetLabel() {
+				switch lp.GetName() {
+				case "tenant_uid":
+					gotTenant = lp.GetValue()
+				case "controller":
+					gotController = lp.GetValue()
+				}
+			}
+			if gotTenant == tenantUID && gotController == controller && m.GetGauge() != nil {
+				return m.GetGauge().GetValue(), true
+			}
+		}
+	}
+	return 0, false
+}
+
+func TestManagerProviderConfigControllerRunningMetric(t *testing.T) {
+	origFlag := flags.F.EnableMultiTenantMetrics
+	flags.F.EnableMultiTenantMetrics = true
+	t.Cleanup(func() {
+		flags.F.EnableMultiTenantMetrics = origFlag
+	})
+
+	ctx := context.Background()
+	logger, _ := ktesting.NewTestContext(t)
+	client := providerconfigclient.NewSimpleClientset()
+	mockStarter := newMockControllerStarter()
+
+	manager := newManager(
+		client,
+		finalizer.ProviderConfigNEGCleanupFinalizer,
+		mockStarter,
+		logger,
+	)
+
+	const tenantUID = "metric-test-tenant-uid"
+	CleanupTenant(tenantUID)
+	t.Cleanup(func() {
+		CleanupTenant(tenantUID)
+	})
+
+	pc := createTestProviderConfig("metric-test-pc")
+	pc.Spec.PrincipalInfo = &providerconfig.PrincipalInfo{
+		ID: tenantUID,
+	}
+
+	if _, err := client.CloudV1().ProviderConfigs().Create(ctx, pc, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Failed to create test ProviderConfig: %v", err)
+	}
+
+	// 1. Start fails -> providerconfig_controller_running{controller="neg",tenant_uid="metric-test-tenant-uid"} == 0
+	mockStarter.shouldFailStart = true
+	if err := manager.StartControllersForProviderConfig(pc); err == nil {
+		t.Fatal("Expected StartControllersForProviderConfig to fail")
+	}
+
+	mg := mtmetrics.DefaultMultiGatherer.(*mtmetrics.MultiGatherer)
+	mfs, err := mg.Gather()
+	if err != nil {
+		t.Fatalf("Gather failed: %v", err)
+	}
+	val, found := getControllerRunningMetric(mfs, tenantUID, "neg")
+	if !found {
+		t.Fatalf("Expected providerconfig_controller_running metric for tenant %q and controller %q after failed start", tenantUID, "neg")
+	}
+	if val != 0 {
+		t.Errorf("providerconfig_controller_running = %v, want 0", val)
+	}
+
+	// 2. Start succeeds -> providerconfig_controller_running{controller="neg",tenant_uid="metric-test-tenant-uid"} == 1
+	mockStarter.shouldFailStart = false
+	if err := manager.StartControllersForProviderConfig(pc); err != nil {
+		t.Fatalf("StartControllersForProviderConfig failed: %v", err)
+	}
+
+	mfs, err = mg.Gather()
+	if err != nil {
+		t.Fatalf("Gather failed: %v", err)
+	}
+	val, found = getControllerRunningMetric(mfs, tenantUID, "neg")
+	if !found {
+		t.Fatalf("Expected providerconfig_controller_running metric for tenant %q and controller %q after successful start", tenantUID, "neg")
+	}
+	if val != 1 {
+		t.Errorf("providerconfig_controller_running = %v, want 1", val)
+	}
+
+	// 3. Stop + ForceCleanupTenant -> metric is unregistered
+	if err := manager.StopControllersForProviderConfig(pc); err != nil {
+		t.Fatalf("StopControllersForProviderConfig failed: %v", err)
+	}
+	manager.ForceCleanupTenant(pc.Name)
+
+	mfs, err = mg.Gather()
+	if err != nil {
+		t.Fatalf("Gather failed: %v", err)
+	}
+	if _, found := getControllerRunningMetric(mfs, tenantUID, "neg"); found {
+		t.Errorf("Expected providerconfig_controller_running metric for tenant %q to be unregistered after ForceCleanupTenant", tenantUID)
 	}
 }

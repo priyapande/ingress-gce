@@ -2,11 +2,14 @@ package framework
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/GoogleCloudPlatform/gke-enterprise-mt/pkg/mtmetrics"
+	"github.com/prometheus/client_golang/prometheus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	providerconfig "k8s.io/ingress-gce/pkg/apis/providerconfig/v1"
@@ -14,6 +17,49 @@ import (
 	providerconfigclient "k8s.io/ingress-gce/pkg/providerconfig/client/clientset/versioned"
 	"k8s.io/klog/v2"
 )
+
+var tenantFactories sync.Map
+
+// GetOrCreateFactory returns the shared MTMetricFactory for the given tenantUID,
+// creating and registering it with DefaultMultiGatherer if it does not yet exist.
+func GetOrCreateFactory(tenantUID string) *mtmetrics.MTMetricFactory {
+	if v, ok := tenantFactories.Load(tenantUID); ok {
+		return v.(*mtmetrics.MTMetricFactory)
+	}
+
+	f := mtmetrics.NewMTMetricFactory(tenantUID, prometheus.DefaultRegisterer, mtmetrics.DefaultGlobalTracker)
+	actual, loaded := tenantFactories.LoadOrStore(tenantUID, f)
+	if loaded {
+		f.Cleanup()
+		return actual.(*mtmetrics.MTMetricFactory)
+	}
+	mtmetrics.DefaultMultiGatherer.Unregister(tenantUID)
+	_ = mtmetrics.DefaultMultiGatherer.Register(tenantUID, f.Registry())
+	return f
+}
+
+// RegisterTenantFactory associates an existing MTMetricFactory with tenantUID in the
+// shared registry and registers its prometheus.Registry with DefaultMultiGatherer.
+func RegisterTenantFactory(tenantUID string, f *mtmetrics.MTMetricFactory) {
+	if f == nil {
+		return
+	}
+	mtmetrics.DefaultMultiGatherer.Unregister(tenantUID)
+	_ = mtmetrics.DefaultMultiGatherer.Register(tenantUID, f.Registry())
+	tenantFactories.Store(tenantUID, f)
+}
+
+// CleanupTenant unregisters the tenant from DefaultMultiGatherer, resets its
+// GlobalMetricsTracker state, and removes the cached MTMetricFactory.
+func CleanupTenant(tenantUID string) {
+	v, ok := tenantFactories.LoadAndDelete(tenantUID)
+	if ok {
+		v.(*mtmetrics.MTMetricFactory).Cleanup()
+	} else {
+		mtmetrics.DefaultGlobalTracker.ResetTenant(tenantUID)
+	}
+	mtmetrics.DefaultMultiGatherer.Unregister(tenantUID)
+}
 
 type deletingTenantState struct {
 	tenantUID string
@@ -34,8 +80,10 @@ type manager struct {
 	finalizerName        string
 	controllerStarter    ControllerStarter
 
-	deletingMu sync.Mutex
-	deleting   map[string]*deletingTenantState
+	deletingMu   sync.Mutex
+	deleting     map[string]*deletingTenantState
+	tenantUIDs   map[string]string
+	failedStarts map[string]bool
 }
 
 // newManager constructs a new generic ProviderConfig controller manager.
@@ -53,12 +101,64 @@ func newManager(
 		finalizerName:        finalizerName,
 		controllerStarter:    controllerStarter,
 		deleting:             make(map[string]*deletingTenantState),
+		tenantUIDs:           make(map[string]string),
+		failedStarts:         make(map[string]bool),
 	}
 }
 
 // providerConfigKey returns the key for a ProviderConfig in the controller map.
 func providerConfigKey(pc *providerconfig.ProviderConfig) string {
 	return pc.Name
+}
+
+func resolveTenantUID(pc *providerconfig.ProviderConfig, logger klog.Logger) string {
+	tenantUID := ""
+	if pc.Spec.PrincipalInfo != nil {
+		tenantUID = pc.Spec.PrincipalInfo.ID
+	}
+	if tenantUID == "" {
+		logger.Info("tenant UID from Spec.PrincipalInfo.ID is empty, fallback to pc.Name")
+		tenantUID = pc.Name
+	}
+	return tenantUID
+}
+
+func controllerNameFromFinalizer(finalizerName string) string {
+	name := finalizerName
+	if idx := strings.LastIndex(name, "/"); idx != -1 && idx+1 < len(name) {
+		name = name[idx+1:]
+	}
+	name = strings.TrimSuffix(name, "-cleanup")
+	name = strings.TrimPrefix(name, "providerconfig-")
+	if name == "" {
+		return finalizerName
+	}
+	return name
+}
+
+func (m *manager) setControllerRunningMetric(tenantUID string, val float64) {
+	if tenantUID == "" {
+		return
+	}
+	factory := GetOrCreateFactory(tenantUID)
+	gauge, err := factory.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "providerconfig_controller_running",
+		Help: "Indicates whether the ProviderConfig controller is running (1) or failed to start (0) for a tenant.",
+	}, []string{"controller"})
+	if err != nil {
+		var are prometheus.AlreadyRegisteredError
+		if errors.As(err, &are) {
+			if existing, ok := are.ExistingCollector.(*prometheus.GaugeVec); ok {
+				gauge = existing
+				err = nil
+			}
+		}
+		if err != nil {
+			m.logger.Error(err, "failed to register providerconfig_controller_running gauge", "tenantUID", tenantUID)
+			return
+		}
+	}
+	gauge.WithLabelValues(controllerNameFromFinalizer(m.finalizerName)).Set(val)
 }
 
 // rollbackFinalizerOnStartFailure removes the finalizer after a start failure
@@ -87,18 +187,29 @@ func (m *manager) StartControllersForProviderConfig(pc *providerconfig.ProviderC
 	}
 
 	pcKey := providerConfigKey(pc)
+	tenantUID := resolveTenantUID(pc, logger)
 
 	m.deletingMu.Lock()
 	if state, exists := m.deleting[pcKey]; exists {
 		state.cancel()
 		delete(m.deleting, pcKey)
 	}
+	m.tenantUIDs[pcKey] = tenantUID
+	wasFailedStart := m.failedStarts[pcKey]
+	delete(m.failedStarts, pcKey)
 	m.deletingMu.Unlock()
 
 	cs, existed := m.controllers.GetOrCreate(pcKey)
 	if existed && cs.stopCh != nil {
 		logger.Info("Controllers for provider config already exist, skipping start")
 		return nil
+	}
+
+	// If a previous start attempt failed, reset any stale factory from that failed attempt
+	// before invoking controllerStarter so that controllers creating a fresh MTMetricFactory
+	// do not collide with the failed attempt's factory.
+	if wasFailedStart {
+		CleanupTenant(tenantUID)
 	}
 
 	logger.Info("Starting controllers for provider config")
@@ -110,6 +221,10 @@ func (m *manager) StartControllersForProviderConfig(pc *providerconfig.ProviderC
 		if !existed {
 			m.controllers.Delete(pcKey)
 		}
+		m.deletingMu.Lock()
+		m.failedStarts[pcKey] = true
+		m.deletingMu.Unlock()
+		m.setControllerRunningMetric(tenantUID, 0)
 		return fmt.Errorf("failed to ensure finalizer %s for provider config %s: %w", m.finalizerName, pcKey, err)
 	}
 
@@ -121,10 +236,28 @@ func (m *manager) StartControllersForProviderConfig(pc *providerconfig.ProviderC
 		if !hadFinalizer {
 			m.rollbackFinalizerOnStartFailure(pc, logger, err)
 		}
+		m.deletingMu.Lock()
+		m.failedStarts[pcKey] = true
+		m.deletingMu.Unlock()
+		m.setControllerRunningMetric(tenantUID, 0)
 		return fmt.Errorf("failed to start controller for provider config %s: %w", pcKey, err)
+	}
+	if controllerStopCh == nil {
+		if !existed {
+			m.controllers.Delete(pcKey)
+		}
+		if !hadFinalizer {
+			m.rollbackFinalizerOnStartFailure(pc, logger, fmt.Errorf("StartController returned nil stop channel"))
+		}
+		m.deletingMu.Lock()
+		m.failedStarts[pcKey] = true
+		m.deletingMu.Unlock()
+		m.setControllerRunningMetric(tenantUID, 0)
+		return fmt.Errorf("controller starter returned nil stop channel for provider config %s", pcKey)
 	}
 
 	cs.stopCh = controllerStopCh
+	m.setControllerRunningMetric(tenantUID, 1)
 
 	logger.Info("Started controllers for provider config")
 	return nil
@@ -138,17 +271,10 @@ func (m *manager) StopControllersForProviderConfig(pc *providerconfig.ProviderCo
 	logger := m.logger.WithValues("providerConfigName", pc.Name)
 
 	pcKey := providerConfigKey(pc)
-
-	tenantUID := ""
-	if pc.Spec.PrincipalInfo != nil {
-		tenantUID = pc.Spec.PrincipalInfo.ID
-	}
-	if tenantUID == "" {
-		logger.Info("tenant UID from Spec.PrincipalInfo.ID is empty, fallback to pc.Name")
-		tenantUID = pc.Name
-	}
+	tenantUID := resolveTenantUID(pc, logger)
 
 	m.deletingMu.Lock()
+	m.tenantUIDs[pcKey] = tenantUID
 	if _, exists := m.deleting[pcKey]; !exists {
 		tCtx, cancel := context.WithCancel(context.Background())
 		m.deleting[pcKey] = &deletingTenantState{
@@ -205,11 +331,15 @@ func (m *manager) ForceCleanupTenant(pcKey string) {
 		state.cancel()
 		tenantUID = state.tenantUID
 		delete(m.deleting, pcKey)
+	} else if cachedUID, ok := m.tenantUIDs[pcKey]; ok {
+		tenantUID = cachedUID
 	}
+	delete(m.tenantUIDs, pcKey)
+	delete(m.failedStarts, pcKey)
 	m.deletingMu.Unlock()
 
-	if tenantUID != "" {
-		mtmetrics.DefaultMultiGatherer.Unregister(tenantUID)
-		mtmetrics.DefaultGlobalTracker.ResetTenant(tenantUID)
+	if tenantUID == "" {
+		tenantUID = pcKey
 	}
+	CleanupTenant(tenantUID)
 }
