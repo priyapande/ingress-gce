@@ -16,6 +16,7 @@ import (
 	negbindingv1beta1 "k8s.io/ingress-gce/pkg/apis/negbinding/v1beta1"
 	providerconfig "k8s.io/ingress-gce/pkg/apis/providerconfig/v1"
 	svcnegv1 "k8s.io/ingress-gce/pkg/apis/svcneg/v1beta1"
+	"k8s.io/ingress-gce/pkg/flags"
 	multiprojectgce "k8s.io/ingress-gce/pkg/multiproject/common/gce"
 	multiprojectinformers "k8s.io/ingress-gce/pkg/multiproject/neg/informerset"
 	"k8s.io/ingress-gce/pkg/neg"
@@ -294,4 +295,88 @@ func TestStartNEGController_DefensiveUnregisterOnRapidRestart(t *testing.T) {
 		t.Fatalf("StartNEGController failed on rapid restart: %v", err)
 	}
 	close(stopCh)
+}
+
+// TestStartNEGController_KillSwitchDisablesMultiTenantMetrics verifies that when
+// --enable-multitenant-metrics=false, StartNEGController falls back to StdMetricFactory
+// and does not register a tenant gatherer in DefaultMultiGatherer.
+func TestStartNEGController_KillSwitchDisablesMultiTenantMetrics(t *testing.T) {
+	origEnableMTMetrics := flags.F.EnableMultiTenantMetrics
+	flags.F.EnableMultiTenantMetrics = false
+	defer func() {
+		flags.F.EnableMultiTenantMetrics = origEnableMTMetrics
+	}()
+
+	logger, _ := ktesting.NewTestContext(t)
+	kubeClient := k8sfake.NewSimpleClientset()
+	svcNegClient := svcnegfake.NewSimpleClientset()
+	negBindingClient := negbindingfake.NewSimpleClientset()
+
+	test.PrependBookmarkReactor(&kubeClient.Fake, kubeClient.Tracker(), "*", &providerconfig.ProviderConfig{
+		ObjectMeta: test.DefaultBookmarkObjectMeta,
+	})
+	test.PrependBookmarkReactor(&svcNegClient.Fake, svcNegClient.Tracker(), "*", &svcnegv1.ServiceNetworkEndpointGroup{
+		ObjectMeta: test.DefaultBookmarkObjectMeta,
+	})
+	test.PrependBookmarkReactor(&negBindingClient.Fake, negBindingClient.Tracker(), "*", &negbindingv1beta1.NetworkEndpointGroupBinding{
+		ObjectMeta: test.DefaultBookmarkObjectMeta,
+	})
+
+	informers := multiprojectinformers.NewInformerSet(kubeClient, svcNegClient, negBindingClient, networkclient.Interface(nil), nodetopologyclient.Interface(nil), metav1.Duration{})
+	globalStop := make(chan struct{})
+	t.Cleanup(func() { close(globalStop) })
+	if err := informers.Start(globalStop, logger); err != nil {
+		t.Fatalf("start informers: %v", err)
+	}
+
+	tenantUID := "tenant-killswitch-off"
+	pc := &providerconfig.ProviderConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "pc-killswitch-off"},
+		Spec: providerconfig.ProviderConfigSpec{
+			PrincipalInfo: &providerconfig.PrincipalInfo{ID: tenantUID},
+			ProjectID:     "test-project",
+			ProjectNumber: 123,
+			NetworkConfig: providerconfig.ProviderNetworkConfig{
+				Network:    "net-1",
+				SubnetInfo: providerconfig.ProviderConfigSubnetInfo{Subnetwork: "sub-1"},
+			},
+		},
+	}
+	kubeSystemUID := types.UID("uid")
+	rootNamer := namer.NewNamer("clusteruid", "", logger)
+	l4Namer := namer.NewL4Namer(string(kubeSystemUID), rootNamer)
+	lpCfg := labels.PodLabelPropagationConfig{}
+	gceCreator := multiprojectgce.NewGCEFake()
+	cloud, err := gceCreator.GCEForProviderConfig(pc, logger)
+	if err != nil {
+		t.Fatalf("create fake cloud: %v", err)
+	}
+
+	stopCh, err := StartNEGController(
+		informers,
+		kubeClient,
+		kubeClient,
+		svcNegClient,
+		negBindingClient,
+		networkclient.Interface(nil),
+		nodetopologyclient.Interface(nil),
+		kubeSystemUID,
+		rootNamer,
+		l4Namer,
+		lpCfg,
+		cloud,
+		globalStop,
+		logger,
+		pc,
+	)
+	if err != nil {
+		t.Fatalf("StartNEGController with EnableMultiTenantMetrics=false failed: %v", err)
+	}
+	defer close(stopCh)
+
+	// Verify that tenant was NOT registered in DefaultMultiGatherer when kill switch is false.
+	if regErr := mtmetrics.DefaultMultiGatherer.Register(tenantUID, prometheus.NewRegistry()); regErr != nil {
+		t.Fatalf("expected tenant %q not to be registered in DefaultMultiGatherer when EnableMultiTenantMetrics=false, got: %v", tenantUID, regErr)
+	}
+	mtmetrics.DefaultMultiGatherer.Unregister(tenantUID)
 }

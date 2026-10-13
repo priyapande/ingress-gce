@@ -105,8 +105,10 @@ func TestLoopbackOnly(t *testing.T) {
 
 func TestMultitenancyMetricsEndpoint(t *testing.T) {
 	origMultiProject := flags.F.EnableMultiProjectMode
+	origMultiTenantMetrics := flags.F.EnableMultiTenantMetrics
 	defer func() {
 		flags.F.EnableMultiProjectMode = origMultiProject
+		flags.F.EnableMultiTenantMetrics = origMultiTenantMetrics
 	}()
 
 	gatherer, ok := mtmetrics.DefaultMultiGatherer.(prometheus.Gatherer)
@@ -115,36 +117,48 @@ func TestMultitenancyMetricsEndpoint(t *testing.T) {
 	}
 
 	testCases := []struct {
-		name                   string
-		enableMultiProjectMode bool
-		remoteAddr             string
-		wantStatusCode         int
+		name                     string
+		enableMultiProjectMode   bool
+		enableMultiTenantMetrics bool
+		remoteAddr               string
+		wantStatusCode           int
 	}{
 		{
-			name:                   "/metrics/multitenancy rejects external non-loopback requests when multi-project mode enabled",
-			enableMultiProjectMode: true,
-			remoteAddr:             "10.128.0.5:54321",
-			wantStatusCode:         http.StatusForbidden,
+			name:                     "/metrics/multitenancy rejects external non-loopback requests when multi-project mode enabled",
+			enableMultiProjectMode:   true,
+			enableMultiTenantMetrics: true,
+			remoteAddr:               "10.128.0.5:54321",
+			wantStatusCode:           http.StatusForbidden,
 		},
 		{
-			name:                   "/metrics/multitenancy allows loopback requests when multi-project mode enabled",
-			enableMultiProjectMode: true,
-			remoteAddr:             "127.0.0.1:54321",
-			wantStatusCode:         http.StatusOK,
+			name:                     "/metrics/multitenancy allows loopback requests when multi-project mode enabled",
+			enableMultiProjectMode:   true,
+			enableMultiTenantMetrics: true,
+			remoteAddr:               "127.0.0.1:54321",
+			wantStatusCode:           http.StatusOK,
 		},
 		{
-			name:                   "/metrics/multitenancy is not registered when multi-project mode disabled",
-			enableMultiProjectMode: false,
-			remoteAddr:             "127.0.0.1:54321",
-			wantStatusCode:         http.StatusNotFound,
+			name:                     "/metrics/multitenancy is not registered when multi-project mode disabled",
+			enableMultiProjectMode:   false,
+			enableMultiTenantMetrics: true,
+			remoteAddr:               "127.0.0.1:54321",
+			wantStatusCode:           http.StatusNotFound,
+		},
+		{
+			name:                     "/metrics/multitenancy is not registered when enable-multitenant-metrics kill switch is false",
+			enableMultiProjectMode:   true,
+			enableMultiTenantMetrics: false,
+			remoteAddr:               "127.0.0.1:54321",
+			wantStatusCode:           http.StatusNotFound,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			flags.F.EnableMultiProjectMode = tc.enableMultiProjectMode
+			flags.F.EnableMultiTenantMetrics = tc.enableMultiTenantMetrics
 			mux := http.NewServeMux()
-			if flags.F.EnableMultiProjectMode {
+			if flags.F.EnableMultiProjectMode && flags.F.EnableMultiTenantMetrics {
 				mux.HandleFunc("/metrics/multitenancy", loopbackOnly(promhttp.HandlerFor(gatherer, promhttp.HandlerOpts{})))
 			}
 
@@ -155,8 +169,8 @@ func TestMultitenancyMetricsEndpoint(t *testing.T) {
 			mux.ServeHTTP(rec, req)
 
 			if rec.Code != tc.wantStatusCode {
-				t.Errorf("GET /metrics/multitenancy (EnableMultiProjectMode=%v) from %s returned status %d, want %d",
-					tc.enableMultiProjectMode, tc.remoteAddr, rec.Code, tc.wantStatusCode)
+				t.Errorf("GET /metrics/multitenancy (EnableMultiProjectMode=%v, EnableMultiTenantMetrics=%v) from %s returned status %d, want %d",
+					tc.enableMultiProjectMode, tc.enableMultiTenantMetrics, tc.remoteAddr, rec.Code, tc.wantStatusCode)
 			}
 		})
 	}

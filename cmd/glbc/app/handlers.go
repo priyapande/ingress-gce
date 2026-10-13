@@ -43,7 +43,7 @@ func RunHTTPServer(healthChecker func() systemhealth.HealthCheckResults, logger 
 	http.HandleFunc("/healthz", healthCheckHandler(healthChecker, logger))
 	http.HandleFunc("/flag", flagHandler)
 	http.Handle("/metrics", promhttp.Handler())
-	if flags.F.EnableMultiProjectMode {
+	if flags.F.EnableMultiProjectMode && flags.F.EnableMultiTenantMetrics {
 		gatherer, ok := mtmetrics.DefaultMultiGatherer.(prometheus.Gatherer)
 		if !ok {
 			klog.Fatal("Failed to initialize multi-tenant metrics: mtmetrics.DefaultMultiGatherer does not implement prometheus.Gatherer")

@@ -13,6 +13,7 @@ import (
 	"k8s.io/cloud-provider-gcp/providers/gce"
 	providerconfig "k8s.io/ingress-gce/pkg/apis/providerconfig/v1"
 	"k8s.io/ingress-gce/pkg/flags"
+	"k8s.io/ingress-gce/pkg/multiproject/framework"
 	multiprojectinformers "k8s.io/ingress-gce/pkg/multiproject/neg/informerset"
 	"k8s.io/ingress-gce/pkg/neg"
 	"k8s.io/ingress-gce/pkg/neg/metrics"
@@ -80,11 +81,18 @@ func StartNEGController(
 	if providerConfig.Spec.PrincipalInfo != nil && providerConfig.Spec.PrincipalInfo.ID != "" {
 		tenantUID = providerConfig.Spec.PrincipalInfo.ID
 	}
-	mtFactory := mtmetrics.NewMTMetricFactory(tenantUID, prometheus.DefaultRegisterer, mtmetrics.DefaultGlobalTracker)
+	var metricFactory mtmetrics.MetricFactory
+	var mtFactory *mtmetrics.MTMetricFactory
+	if flags.F.EnableMultiTenantMetrics {
+		mtFactory = mtmetrics.NewMTMetricFactory(tenantUID, prometheus.DefaultRegisterer, mtmetrics.DefaultGlobalTracker)
+		metricFactory = mtFactory
+	} else {
+		metricFactory = mtmetrics.NewStdMetricFactory(prometheus.DefaultRegisterer)
+	}
 
-	tenantSyncerMetrics, err := syncMetrics.NewNegMetricsCollectorWithFactory(flags.F.NegMetricsExportInterval, mtFactory, logger)
+	tenantSyncerMetrics, err := syncMetrics.NewNegMetricsCollectorWithFactory(flags.F.NegMetricsExportInterval, metricFactory, logger)
 	if err != nil {
-		mtFactory.Cleanup()
+		metricFactory.Cleanup()
 		return nil, fmt.Errorf("failed to initialize syncer metrics: %w", err)
 	}
 
@@ -118,21 +126,19 @@ func StartNEGController(
 		lpConfig,
 		joinedStopCh,
 		logger,
-		mtFactory,
+		metricFactory,
 		tenantSyncerMetrics,
 	)
 	if err != nil {
-		mtFactory.Cleanup()
+		metricFactory.Cleanup()
 		return nil, fmt.Errorf("failed to create NEG controller: %w", err)
 	}
 
-	// DefaultMultiGatherer.Register returns an error without overwriting if tenantUID
-	// is still present (e.g. during framework/manager.go's 24-hour ForceCleanupTenant
-	// retention window when a ProviderConfig is recreated). Unregister first so the
-	// new controller's mtFactory.Registry() replaces any prior registry for this tenant.
-	mtmetrics.DefaultMultiGatherer.Unregister(tenantUID)
-	if err := mtmetrics.DefaultMultiGatherer.Register(tenantUID, mtFactory.Registry()); err != nil {
-		logger.Error(err, "Failed to register multi-tenant gatherer for tenant", "tenantUID", tenantUID)
+	if mtFactory != nil {
+		// Register the tenant factory in framework so DefaultMultiGatherer exposes this
+		// tenant's registry and framework/manager.go reuses the same MTMetricFactory for
+		// providerconfig_controller_running (1:1:1 tenant/factory/registry invariant).
+		framework.RegisterTenantFactory(tenantUID, mtFactory)
 	}
 
 	go func() {
@@ -143,7 +149,7 @@ func StartNEGController(
 			// DefaultMultiGatherer unregistration is managed by framework/manager.go's
 			// ForceCleanupTenant after the 24-hour grace period (or by pre-register Unregister
 			// above if the tenant is restarted earlier).
-			mtFactory.Cleanup()
+			metricFactory.Cleanup()
 		}()
 		select {
 		case <-globalStopCh:

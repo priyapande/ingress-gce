@@ -140,6 +140,7 @@ var F = struct {
 	EnableWeightedL4NetLB                       bool
 	EnableDiscretePortForwarding                bool
 	EnableMultiProjectMode                      bool
+	EnableMultiTenantMetrics                    bool
 	EnableL4ILBZonalAffinity                    bool
 	ProviderConfigNameLabelKey                  string
 	EnableL4ILBMixedProtocol                    bool
@@ -177,7 +178,8 @@ var F = struct {
 	// DEPRECATED: DeprecatedEnableFrontendConfig is on by default and will be removed in a future release.
 	DeprecatedEnableFrontendConfig bool
 }{
-	GCERateLimitScale: 1.0,
+	GCERateLimitScale:        1.0,
+	EnableMultiTenantMetrics: true,
 }
 
 type LeaderElectionConfiguration struct {
@@ -368,6 +370,7 @@ L7 load balancing. CSV values accepted. Example: -node-port-ranges=80,8080,400-5
 	flag.IntVar(&F.KubeClientBurst, "kube-client-burst", 0, "The burst QPS that the controllers' kube client should adhere to through client side throttling. If zero, client will be created with default settings.")
 	flag.BoolVar(&F.EnableDiscretePortForwarding, "enable-discrete-port-forwarding", false, "Enable forwarding of individual ports instead of port ranges.")
 	flag.BoolVar(&F.EnableMultiProjectMode, "enable-multi-project-mode", false, "Enable running in multi-project mode.")
+	flag.BoolVar(&F.EnableMultiTenantMetrics, "enable-multitenant-metrics", true, "Enable multi-tenant metrics collection and the /metrics/multitenancy endpoint when running in multi-project mode.")
 	flag.BoolVar(&F.EnableL4ILBMixedProtocol, "enable-l4ilb-mixed-protocol", false, "Enable support for mixed protocol L4 internal load balancers.")
 	flag.BoolVar(&F.EnableL4NetLBMixedProtocol, "enable-l4netlb-mixed-protocol", false, "Enable support for mixed protocol L4 external load balancers.")
 	flag.BoolVar(&F.EnableL3ForwardingRuleForNetLBMixedProtocol, "enable-l3-default-forwarding-rule-for-netlb-mixed-protocol", false, "Enable support for mixed protocol L4 external load balancers using L3_DEFAULT forwarding rule. This has multiple benefits over the previous NetLB mixed protocol implementation, including lower cost and no traffic interruption on mixed-to-mixed port changes. This flag will eventually be a default implementation for --enable-l4netlb-mixed-protocol.")

@@ -13,6 +13,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	providerconfig "k8s.io/ingress-gce/pkg/apis/providerconfig/v1"
+	"k8s.io/ingress-gce/pkg/flags"
 	"k8s.io/ingress-gce/pkg/multiproject/common/finalizer"
 	providerconfigclient "k8s.io/ingress-gce/pkg/providerconfig/client/clientset/versioned"
 	"k8s.io/klog/v2"
@@ -137,7 +138,7 @@ func controllerNameFromFinalizer(finalizerName string) string {
 }
 
 func (m *manager) setControllerRunningMetric(tenantUID string, val float64) {
-	if tenantUID == "" {
+	if tenantUID == "" || !flags.F.EnableMultiTenantMetrics {
 		return
 	}
 	factory := GetOrCreateFactory(tenantUID)
